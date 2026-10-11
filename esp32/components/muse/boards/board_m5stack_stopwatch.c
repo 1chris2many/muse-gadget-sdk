@@ -35,6 +35,7 @@
  * src/M5PM1.h/btnGetState(), BTN_CFG_1 and SYS_CMD, not an invented PWR GPIO.
  * Vendor clones read for this change: M5Unified fd40d58, M5GFX c5a3fef.
  */
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -47,8 +48,10 @@
 #include "esp_lcd_co5300.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
+#include "esp_rom_gpio.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -58,6 +61,7 @@
 #include "muse_board.h"
 #include "muse_lcd_bands.h"
 #include "muse_mem.h"
+#include "soc/spi_periph.h"
 
 static const char *TAG = "board";
 
@@ -72,6 +76,9 @@ static const char *TAG = "board";
 #define LCD_D3 GPIO_NUM_45
 #define DRAW_BUF_LINES 118         /* four bands to the screen (muse_lcd_bands.h) */
 #define LCD_CHUNK_BYTES (LCD_RES * 8 * 2)
+#define LCD_LEVEL_BOOT 0xA0        /* M5GFX's brightness, until the UI sets its own */
+#define LCD_POWER_UP_MS 20         /* 3V3_L3B up before the reset is let go; M5GFX waits 10 */
+#define LCD_RESET_MS 120           /* the panel's wake from reset, as init() waits */
 
 #define I2C_SDA GPIO_NUM_47
 #define I2C_SCL GPIO_NUM_48
@@ -166,6 +173,11 @@ static i2c_master_dev_handle_t s_pmic, s_ioe, s_tp;
 static SemaphoreHandle_t s_ioe_lock;
 static esp_lcd_panel_io_handle_t s_io;
 static esp_lcd_panel_handle_t s_panel;
+/* The panel's state, kept on the send task (muse_lcd_bands_run): the CO5300
+ * forgets its setup, brightness and sleep with 3V3_L3B (display_pause). */
+static bool s_lcd_off;                  /* rail off: nothing goes to the panel */
+static uint8_t s_lcd_level = LCD_LEVEL_BOOT;   /* the last 0x51 the UI set */
+static bool s_lcd_asleep;               /* the UI's panel_sleep() */
 static muse_gpio_button_t s_talk, s_speaker;
 static muse_gpio_button_t s_irq_line;   /* GPIO12, only ever waited on: idle high */
 static bool s_power_pressed, s_power_candidate, s_power_armed, s_power_long;
@@ -434,14 +446,49 @@ static esp_err_t init(void)
 }
 
 /* M5GFX's Panel_StopWatch init, less the tearing line: COLMOD and MADCTL come
- * from the driver first. */
+ * from the driver first. Brightness (0x51) and display on (0x29) follow in
+ * panel_setup(), once the panel's memory is black. */
 static const co5300_lcd_init_cmd_t s_lcd_init[] = {
     { 0x11, NULL, 0, 150 },                     /* sleep out */
     { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },
     { 0x53, (uint8_t[]){ 0x20 }, 1, 0 },        /* brightness control on */
-    { 0x51, (uint8_t[]){ 0xA0 }, 1, 0 },        /* brightness, until the UI sets its own */
-    { 0x29, NULL, 0, 0 },                       /* display on */
 };
+
+/* A CO5300 command over QSPI. */
+static void lcd_cmd(uint8_t cmd, const void *param, size_t n)
+{
+    esp_lcd_panel_io_tx_param(s_io, (0x02 << 24) | (cmd << 8), param, n);
+}
+
+/*
+ * At boot, and powered again after a pause: the panel has lost its setup and
+ * what it showed. A software reset (its reset line is the expander's), the
+ * init (ending with SLPOUT), then black over its random memory before the
+ * display goes on, so nothing shows before LVGL's redraw reaches it. Then the
+ * last brightness and sleep state the UI set. After registration this runs
+ * on the send task between bands, so the chunk buffers are idle; the
+ * clearing takes a buffer of its own for a moment.
+ */
+static void panel_setup(void *arg)
+{
+    (void)arg;
+    esp_lcd_panel_reset(s_panel);
+    esp_lcd_panel_init(s_panel);
+    uint8_t *black = heap_caps_calloc(1, LCD_CHUNK_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (black) {
+        for (int y = 0; y < LCD_RES; y += 8) {
+            esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_RES, y + 8 < LCD_RES ? y + 8 : LCD_RES, black);
+        }
+    }
+    lcd_cmd(0x51, &s_lcd_level, 1);             /* waits for the queued draws first */
+    esp_lcd_panel_disp_on_off(s_panel, true);
+    free(black);
+    if (s_lcd_asleep) {
+        lcd_cmd(0x10, NULL, 0);                 /* the screen is off: as the UI left it */
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    s_lcd_off = false;
+}
 
 /* The CO5300 needs even-aligned update windows. */
 static void round_area(lv_event_t *e)
@@ -496,9 +543,7 @@ static lv_display_t *display_start(lv_indev_t **touch)
         return NULL;
     }
     esp_lcd_panel_set_gap(s_panel, LCD_GAP_X, 0);
-    esp_lcd_panel_reset(s_panel);
-    esp_lcd_panel_init(s_panel);
-    esp_lcd_panel_disp_on_off(s_panel, true);
+    panel_setup(NULL);
 
     esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
     adapter_cfg.task_core_id = MUSE_UI_CORE;
@@ -542,10 +587,13 @@ static bool display_lock(int timeout_ms)
     return esp_lv_adapter_lock(timeout_ms) == ESP_OK;
 }
 
+/* CO5300 "write display brightness" (0x51), kept for the next power-up. */
 static void send_brightness(void *level)
 {
-    /* CO5300 "write display brightness" (0x51). */
-    esp_lcd_panel_io_tx_param(s_io, (0x02 << 24) | (0x51 << 8), level, 1);
+    s_lcd_level = *(uint8_t *)level;
+    if (!s_lcd_off) {
+        lcd_cmd(0x51, &s_lcd_level, 1);
+    }
 }
 
 static void set_brightness(int pct)
@@ -556,7 +604,10 @@ static void set_brightness(int pct)
 
 static void send_sleep(void *sleep)
 {
-    esp_lcd_panel_io_tx_param(s_io, (0x02 << 24) | ((*(bool *)sleep ? 0x10 : 0x11) << 8), NULL, 0);
+    s_lcd_asleep = *(bool *)sleep;
+    if (!s_lcd_off) {
+        lcd_cmd(s_lcd_asleep ? 0x10 : 0x11, NULL, 0);
+    }
 }
 
 /* Plain SLPIN/SLPOUT over the QSPI command path, as on the Waveshare 1.75C. */
@@ -566,15 +617,99 @@ static void panel_sleep(bool sleep)
     vTaskDelay(pdMS_TO_TICKS(120));   /* settle before the next command */
 }
 
-/* Screen off: LVGL stops and the CST820 sleeps until its reset line wakes it. */
+/*
+ * 3V3_L3B (the OLED, and the panel's VBAT through R56; schematic sheets 2, 3
+ * and 5) is off while paused, switched by the expander's IO8 (PYB_L3B_EN).
+ * Idle, the SPI holds CS high, which would feed the unpowered panel, so the
+ * QSPI lines go to plain GPIOs driven low first, as M5's design for "L3A core
+ * active" leaves the L3B side's lines (and the SenseCAP Watcher's lcd_bus).
+ */
+static void lcd_bus(void *spi)
+{
+    const spi_signal_conn_t *sig = &spi_periph_signal[LCD_HOST];
+    const struct {
+        gpio_num_t pin;
+        int in, out;
+    } lines[] = {
+        { LCD_SCLK, -1, sig->spiclk_out },
+        { LCD_D0, sig->spid_in, sig->spid_out },
+        { LCD_D1, sig->spiq_in, sig->spiq_out },
+        { LCD_D2, sig->spiwp_in, sig->spiwp_out },
+        { LCD_D3, sig->spihd_in, sig->spihd_out },
+        { LCD_CS, -1, sig->spics_out[0] },
+    };
+    for (int i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
+        if (*(bool *)spi) {
+            gpio_set_direction(lines[i].pin, lines[i].in >= 0 ? GPIO_MODE_INPUT_OUTPUT : GPIO_MODE_OUTPUT);
+            if (lines[i].in >= 0) {
+                esp_rom_gpio_connect_in_signal(lines[i].pin, lines[i].in, false);
+            }
+            esp_rom_gpio_connect_out_signal(lines[i].pin, lines[i].out, false, false);
+        } else {
+            gpio_set_level(lines[i].pin, 0);
+            gpio_set_direction(lines[i].pin, GPIO_MODE_OUTPUT);
+        }
+    }
+}
+
+/* On the send task: no command reaches the panel from here until panel_setup(). */
+static void panel_off(void *arg)
+{
+    (void)arg;
+    if (!s_lcd_asleep) {
+        lcd_cmd(0x10, NULL, 0);                 /* the UI sleeps it first; just in case */
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    s_lcd_off = true;
+    bool spi = false;
+    lcd_bus(&spi);
+}
+
+/*
+ * Off: the lines low, the panel held in reset (IO5), then the rail. On: the
+ * rail, its power-up time with reset still low, the SPI lines back (CS idles
+ * high before the panel leaves reset), the reset let go, and the panel set up
+ * again with the brightness the UI last set (set_brightness and panel_sleep
+ * only record theirs while the rail is off).
+ */
+static void lcd_power(bool on)
+{
+    if (!on) {
+        muse_lcd_bands_run(panel_off, NULL);
+        ioe_set(IOE_LCD_RST, false);
+        ioe_set(IOE_L3B, false);
+        ESP_LOGI(TAG, "OLED rail off");
+        return;
+    }
+    ioe_set(IOE_L3B, true);
+    vTaskDelay(pdMS_TO_TICKS(LCD_POWER_UP_MS));
+    bool spi = true;
+    muse_lcd_bands_run(lcd_bus, &spi);
+    ioe_set(IOE_LCD_RST, true);
+    vTaskDelay(pdMS_TO_TICKS(LCD_RESET_MS));
+    muse_lcd_bands_run(panel_setup, NULL);
+    ESP_LOGI(TAG, "OLED rail on, panel set up");
+}
+
+/*
+ * Screen off: LVGL stops, the CST820 (on 3V3_L2) sleeps until its reset line
+ * wakes it, and the OLED loses its rail. LVGL redraws the whole screen on
+ * resume, since the panel forgot it.
+ */
 static void display_pause(bool pause)
 {
     if (pause) {
         esp_lv_adapter_pause(-1);
         reg_write(s_tp, TP_REG_SLEEP, (uint8_t[]){ 0x03 }, 1);
+        lcd_power(false);
     } else {
+        lcd_power(true);
         tp_reset();
         esp_lv_adapter_resume();
+        if (esp_lv_adapter_lock(-1) == ESP_OK) {
+            lv_obj_invalidate(lv_screen_active());
+            esp_lv_adapter_unlock();
+        }
     }
 }
 

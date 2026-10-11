@@ -180,12 +180,109 @@ int main(int argc, char **argv) {
 '''
         self.run_cases(self.build("irq", code), 7)
 
+    def test_oled_rail(self):
+        """The OLED's rail goes off while paused and its state comes back with it."""
+        code = COMMON + defines(self.board, r"LCD_RES|LCD_CHUNK_BYTES|LCD_LEVEL_BOOT|LCD_POWER_UP_MS|LCD_RESET_MS|IOE_\w+|TP_\w+") + r'''
+#define MALLOC_CAP_DMA 1
+#define MALLOC_CAP_INTERNAL 2
+#define heap_caps_calloc(n, size, caps) calloc(n, size)
+typedef void *esp_lcd_panel_io_handle_t;
+typedef void *esp_lcd_panel_handle_t;
+static esp_lcd_panel_io_handle_t s_io = (void *)1;
+static esp_lcd_panel_handle_t s_panel = (void *)2;
+static void *s_tp = (void *)3;
+static char ev[4096];
+static uint8_t ioe_out;   /* IO1-8 */
+static void note(const char *fmt, int v) { char b[32]; snprintf(b, sizeof(b), fmt, v); strcat(ev, b); strcat(ev, " "); }
+static int esp_lcd_panel_io_tx_param(void *io, int cmd, const void *param, size_t n) {
+    assert(io == s_io && (cmd >> 24) == 2);
+    assert(ioe_out & IOE_L3B);   /* never to an unpowered panel */
+    if (n == 1) { char b[32]; snprintf(b, sizeof(b), "c%02x=%d ", (cmd >> 8) & 0xff, *(const uint8_t *)param); strcat(ev, b); }
+    else note("c%02x", (cmd >> 8) & 0xff);
+    return ESP_OK;
+}
+static int draws;
+static int esp_lcd_panel_reset(void *p) { assert(p == s_panel && (ioe_out & IOE_L3B)); note("swreset", 0); return 0; }
+static int esp_lcd_panel_init(void *p) { assert(p == s_panel); note("init", 0); return 0; }
+static int esp_lcd_panel_draw_bitmap(void *p, int x1, int y1, int x2, int y2, const void *d) {
+    assert(p == s_panel && x1 == 0 && x2 == LCD_RES && y1 % 2 == 0 && y2 % 2 == 0 && y2 > y1 && d);
+    for (int i = 0; i < LCD_CHUNK_BYTES; i++) assert(((const uint8_t *)d)[i] == 0);
+    if (!draws++) note("black", 0);
+    return 0;
+}
+static int esp_lcd_panel_disp_on_off(void *p, bool on) { assert(p == s_panel && on); note("on", 0); return 0; }
+static void muse_lcd_bands_run(void (*fn)(void *), void *arg) { fn(arg); }
+static void lcd_bus(void *spi) { note(*(bool *)spi ? "bus" : "lines-low", 0); }
+static int ioe_set(uint16_t pins, bool high) {
+    note(pins == IOE_L3B ? "l3b=%d" : pins == IOE_LCD_RST ? "rst=%d" : "ioe?=%d", high);
+    ioe_out = high ? ioe_out | pins : ioe_out & ~pins; return ESP_OK;
+}
+static void vTaskDelay(int ms) { note("wait%d", ms); }
+static void tp_reset(void) { note("tp-reset", 0); }
+static int reg_write(void *dev, uint8_t reg, const uint8_t *v, size_t n) { assert(dev == s_tp && reg == TP_REG_SLEEP && n == 1 && v[0] == 3); note("tp-sleep", 0); return 0; }
+static void esp_lv_adapter_pause(int ms) { assert(ms == -1); note("lv-pause", 0); }
+static void esp_lv_adapter_resume(void) { note("lv-resume", 0); }
+static int esp_lv_adapter_lock(int ms) { (void)ms; return ESP_OK; }
+static void esp_lv_adapter_unlock(void) {}
+static void *lv_screen_active(void) { return (void *)4; }
+static void lv_obj_invalidate(void *o) { assert(o == (void *)4); note("redraw", 0); }
+static bool s_lcd_off;
+static uint8_t s_lcd_level = LCD_LEVEL_BOOT;
+static bool s_lcd_asleep;
+''' + "\n".join(function(self.board, n) for n in (
+            "lcd_cmd", "panel_setup", "send_brightness", "set_brightness", "send_sleep", "panel_sleep",
+            "panel_off", "lcd_power", "display_pause")) + r'''
+static void expect(const char *want) {
+    if (strcmp(ev, want)) { printf("got:  %s\nwant: %s\n", ev, want); exit(1); }
+    ev[0] = 0;
+}
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    int test = atoi(argv[1]);
+    ioe_out = IOE_L3B | IOE_LCD_RST;
+    if (test == 0) {   /* boot: black before display on, M5GFX's brightness */
+        panel_setup(NULL);
+        expect("swreset init black c51=160 on ");
+        assert(draws == (LCD_RES + 7) / 8 && !s_lcd_off);
+    } else if (test == 1) {   /* the usual rest: the UI dims and sleeps the panel, then pauses */
+        set_brightness(80); panel_sleep(false);
+        expect("c51=204 c11 wait120 ");
+        set_brightness(0); panel_sleep(true);
+        expect("c51=0 c10 wait120 ");
+        display_pause(true);
+        expect("lv-pause tp-sleep lines-low rst=0 l3b=0 ");
+        assert(s_lcd_off && !(ioe_out & (IOE_L3B | IOE_LCD_RST)));
+        set_brightness(60);          /* recorded, not sent: the rail is off */
+        panel_sleep(false);
+        expect("wait120 ");
+        set_brightness(0); panel_sleep(true); ev[0] = 0;
+        display_pause(false);        /* back as the UI left it: dark and asleep */
+        expect("l3b=1 wait20 bus rst=1 wait120 swreset init black c51=0 on c10 wait120 "
+               "tp-reset lv-resume redraw ");
+        assert(!s_lcd_off);
+        panel_sleep(false); set_brightness(80);   /* then the UI wakes it */
+        expect("c11 wait120 c51=204 ");
+    } else {   /* paused without the UI's sleep (never expected): sleep it before the rail goes */
+        set_brightness(50); ev[0] = 0;
+        display_pause(true);
+        expect("lv-pause tp-sleep c10 wait120 lines-low rst=0 l3b=0 ");
+        display_pause(false);
+        expect("l3b=1 wait20 bus rst=1 wait120 swreset init black c51=127 on tp-reset lv-resume redraw ");
+    }
+    return 0;
+}
+'''
+        self.run_cases(self.build("oled", code), 3)
+
     def test_rest_wiring(self):
         init = function(self.board, "init")
         self.assertIn("muse_gpio_button_init(&s_irq_line, PMIC_IRQ_GPIO)", init)
         self.assertIn("pmic_irq_setup()", init)
         self.assertRegex(self.board, r"#define PMIC_IRQ_GPIO GPIO_NUM_12\b")
         self.assertIn(".wait_buttons = wait_buttons", self.board)
+        start = self.board.index("static lv_display_t *display_start(")
+        self.assertIn("panel_setup(NULL)", self.board[start:self.board.index("esp_lv_adapter_init", start)])
+        self.assertNotIn("0x29", self.board[self.board.index("s_lcd_init[]"):self.board.index("static void lcd_cmd")])
 
 
 if __name__ == "__main__":
