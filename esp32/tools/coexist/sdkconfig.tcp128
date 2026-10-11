@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Experiment: 128 KiB TCP send buffer and receive window, with window scaling
-# (load after sdkconfig.tx-by-ref: lwIP only offers scaling when PSRAM is
-# required). Receive mailboxes sized for a full window of MSS segments.
+# Experiment: 128 KiB TCP receive window with window scaling, and a 112 KiB
+# send buffer: lwIP's send low-water mark (half the buffer) is 16-bit and
+# must stay 4 MSS below 64 KiB, which caps the send buffer near 117 KiB.
+# Load after sdkconfig.tx-by-ref: lwIP only offers scaling when PSRAM is
+# required. Receive mailboxes sized for a full window of MSS segments.
 CONFIG_LWIP_WND_SCALE=y
 CONFIG_LWIP_TCP_RCV_SCALE=2
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=131072
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=114688
 CONFIG_LWIP_TCP_WND_DEFAULT=131072
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=128
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=128

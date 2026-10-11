@@ -36,6 +36,7 @@ own directory.
 |---|---|
 | `sdkconfig.ble-persist` | `CONFIG_HOMEHUB_BLE_PERSISTENT`: NimBLE stays up after setup, basic GATT service (`main/ble_basic.c`), slow advertising |
 | `sdkconfig.nimble-tuned` | NimBLE for a gadget that is a GATT server **and** a central (scan, connect, GATT client, `main/ble_central.c`): all roles and SMP kept, 3 connections, trimmed prepare-write queue, lists and logging |
+| `sdkconfig.ble-mem` | BLE resident without the RAM cost (after `ble-persist` and `nimble-tuned`): NimBLE host allocations in PSRAM, controller code in flash, BLE and Wi-Fi RX buffers trimmed |
 | `sdkconfig.wifi-trim` | No SoftAP or WPA2-Enterprise (-58 KB flash) |
 | `sdkconfig.net-internal16` | Bench baseline: the pre-change networking (lwIP in internal RAM, 16 KiB windows) |
 | `sdkconfig.tx-by-ref` | Require PSRAM at boot so Wi-Fi transmits lwIP's PSRAM pbufs by reference and window scaling is available |
@@ -116,3 +117,34 @@ BLE scan, TLS RX, and a BLE central connect every fourth cycle. No failures
 (TX 0/79, RX 0/79, central connects 19/19), no resets. Tunnel TX 5.29 Mbit/s
 average (4.83 lowest), TLS RX 5.95 (5.55 lowest); lowest free internal RAM
 25.5 KiB, lowest free DMA-capable RAM 12.9 KiB.
+
+BLE resident with `sdkconfig.ble-mem`, paired production firmware, idle:
+
+| Build | Internal free (largest) | DMA-capable free (largest) |
+|---|---|---|
+| Upstream, BLE released after setup | 82 KiB (58) | 69 KiB (58) |
+| New defaults + `ble-persist` + `nimble-tuned` | 47 KiB (19) | 35 KiB (19) |
+| ... + `ble-mem` | 70 KiB (42) | 54 KiB (42) |
+
+The bench with `ble-mem` (32 KiB windows, no delay) kept BLE scanning (33
+devices idle, 30 with Wi-Fi at 5 Mbit/s) and central connects working, ran
+tunnel TX at 4.66 Mbit/s and TLS RX at 6.13, and never let free DMA-capable
+RAM fall below 46 KiB.
+
+TCP windows at an emulated 50 ms delay (`CONFIG_HOMEHUB_BENCH_RX_DELAY_MS`):
+throughput follows the window up to the C5's CPU.
+
+| Window | Raw TCP tx/rx | TLS RX | Tunnel TX | Lowest DMA free |
+|---|---|---|---|---|
+| 16 KiB, internal | 1.3 / 1.1 | 1.2 | 1.25 | 11 KiB |
+| 32 KiB, PSRAM | 2.4 / 2.3 | 2.4 | 2.5 | 1.5 KiB |
+| 32 KiB + `tx-by-ref` | 2.5 / 2.2 | 2.4 | 2.5 | 12 KiB |
+| 64 KiB + `tx-by-ref` | 4.6 / 4.8 | 4.7 | 4.4 | 12 KiB |
+| 128 KiB RX / 112 KiB TX + `tx-by-ref` | 5.2 / 8.5 | 8.7 | 6.0 (CPU 96%) | 11 KiB |
+
+lwIP caps the send buffer near 117 KiB (its send low-water mark is 16-bit).
+
+Through a paired VM's Home Link tunnel, every build (16 or 32 KiB windows,
+BLE on or off) ran at 2.1-2.5 Mbit/s LAN to VM and 1.6-1.9 VM to LAN, and
+parallel flows shared that total: the limit is on the server path, past the
+gadget, not its windows.
