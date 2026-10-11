@@ -21,9 +21,16 @@
  * blue upper right) and a power button wired to the power chip.
  *
  * Everything shares one I2C bus (GPIO 47/48). M5's power chip (M5PM1, 0x6E)
- * measures the battery and USB; its GPIO2 is the charger's CHG_STAT. M5's IO
- * expander (M5IOE1, 0x4F) switches the rest: IO3 audio power, IO4 touch reset,
- * IO5 panel reset, IO8 the 3V3_L3B rail, IO9 the vibration motor, IO10 the amp.
+ * measures the battery and USB; its GPIO2 is the charger's CHG_STAT and its
+ * GPIO1 the IRQ line to GPIO12 that wakes the paused input task on a red key
+ * click. M5's IO expander (M5IOE1, 0x4F) switches the rest: IO3 the AU_L3B
+ * rail (codec and mic), IO4 touch reset, IO5 panel reset, IO8 the 3V3_L3B
+ * rail (the OLED), IO9 the vibration motor, IO10 the amp. The BMI270 (0x68)
+ * and RTC are on the always-on 3V3_L1; the IMU is put back in suspend at boot.
+ *
+ * At rest on battery (display paused, codecs closed) both L3B rails are off,
+ * with the lines into them parked low, and the chip light-sleeps until a rim
+ * key or the PM1's interrupt: display_pause, codec_power, wait_buttons.
  *
  * Pins and registers are from M5Unified and M5GFX (board_M5StopWatch:
  * M5Unified.inl, Power_Class.inl, M5PM1_Class.inl, M5IOE1_Class.inl; M5GFX.cpp
@@ -34,6 +41,10 @@
  * (app_stopwatch/view/view.cpp) and M5PM1 1.0.6 at 8f1f1a60:
  * src/M5PM1.h/btnGetState(), BTN_CFG_1 and SYS_CMD, not an invented PWR GPIO.
  * Vendor clones read for this change: M5Unified fd40d58, M5GFX c5a3fef.
+ * Rest power: the StopWatch schematic (power network sheet 2, PMIC and LDOs
+ * sheet 3, ESP32 pins sheet 4, IMU, audio, OLED and expander sheet 5), the
+ * M5PM1 user manual (docs/ in M5PM1 be9a545: IRQ Status 1-3, BTN_CFG_1) and
+ * M5Unified's ES8311 notes for the StopWatch (M5Unified.inl).
  */
 #include <stdlib.h>
 #include <string.h>

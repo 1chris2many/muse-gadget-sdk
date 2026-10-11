@@ -219,8 +219,15 @@ the normal battery readings (including while the screen sleeps). This changes
 only M5PM1 `PWR_CFG` (`0x06`) bit 4, preserving charging and the power rails.
 M5's IO expander (M5IOE1) switches the panel and touch resets, audio power
 and the amp; its power chip (M5PM1) reads the battery, charger and red key's
-live state (register `0x48`, bit 0). The IMU, RTC, vibration motor and Grove
-port aren't used yet. [M5Unified](https://github.com/m5stack/M5Unified),
+live state (register `0x48`, bit 0). Asleep on battery, the OLED's rail
+(3V3_L3B) and the audio rail (AU_L3B: codec and mic) are off and the chip
+light-sleeps until a rim key, or the M5PM1's click interrupt on GPIO12, wakes
+it. The red key's click arrives once it's released (about 125 ms later), and a
+press held at rest is found within a second. Waking, the panel takes about
+half a second longer to come back, and the first recording after a rest starts
+about 0.1 s later while the codec is set up again. The IMU is put back in
+suspend at boot; it, the RTC, vibration motor and Grove port aren't used yet.
+[M5Unified](https://github.com/m5stack/M5Unified),
 M5's [factory firmware](https://github.com/m5stack/M5StopWatch-UserDemo)
 and its [M5PM1 1.0.6 driver](https://github.com/m5stack/M5PM1/tree/1.0.6)
 are the references. It enumerates as the chip's own USB serial port, so
