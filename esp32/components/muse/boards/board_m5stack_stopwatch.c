@@ -116,6 +116,33 @@ static const char *TAG = "board";
 #define PMIC_SHUTDOWN 0xA1
 #define POWER_DEBOUNCE_US 30000
 #define POWER_HOLD_US 1500000
+/* The PM1's IRQ output, for wait_buttons(): its GPIO1 (G1_IRQout_ADC) is net
+ * G12_PY_IRQ to ESP32 GPIO12, "PM1: Pull IRQ Low" to wake the S3 (schematic
+ * sheets 2 and 4). M5PM1 user manual, IRQ Status 1-3 and src/M5PM1.h: the pin
+ * is pulled low while an unmasked status bit is set and released once it's
+ * cleared (written 0); mask bits are 1 = masked. */
+#define PMIC_IRQ_GPIO GPIO_NUM_12
+#define PMIC_IRQ_PIN BIT(1)        /* PM1 GPIO1 */
+#define PMIC_FUNC_GPIO1_MASK 0x0C  /* GPIO_FUNC0 [3:2] */
+#define PMIC_FUNC_GPIO1_IRQ 0x04   /* 01 = IRQ output */
+#define PMIC_IRQ_STATUS1 0x40      /* GPIO level changes */
+#define PMIC_IRQ_STATUS2 0x41      /* 5VIN/5VINOUT/battery */
+#define PMIC_IRQ_STATUS3 0x42      /* the power key */
+#define PMIC_IRQ_MASK1 0x43
+#define PMIC_IRQ_MASK2 0x44
+#define PMIC_IRQ_MASK3 0x45
+#define PMIC_IRQ_GPIO_ALL 0x1F
+#define PMIC_IRQ_SYS_ALL 0x3F
+#define PMIC_IRQ_BTN_CLICK BIT(0)
+#define PMIC_IRQ_BTN_WAKE BIT(1)
+#define PMIC_IRQ_BTN_DOUBLE BIT(2)
+#define PMIC_IRQ_BTN_ALL 0x07
+#define PMIC_CLICK_DELAY_MASK 0x06 /* BTN_CFG1 [2:1] */
+#define PMIC_CLICK_DELAY_125MS 0x00
+#define CLICK_CREDIT_US 1500000    /* a click this soon after a release the poll saw was that press */
+#define REST_KEY_POLL_MS 50        /* the red key down or settling while paused: poll it, as before */
+#define REST_FALLBACK_MS 200       /* no PM1 interrupt: the longest a paused wait may last */
+#define IRQ_SETTLE_MS 10           /* the line just fell: the next poll takes the event */
 
 #define IOE_ADDR 0x4F
 #define IOE_MODE 0x03              /* 16 bits, IO1 in bit 0; 1 = output */
@@ -140,8 +167,12 @@ static SemaphoreHandle_t s_ioe_lock;
 static esp_lcd_panel_io_handle_t s_io;
 static esp_lcd_panel_handle_t s_panel;
 static muse_gpio_button_t s_talk, s_speaker;
+static muse_gpio_button_t s_irq_line;   /* GPIO12, only ever waited on: idle high */
 static bool s_power_pressed, s_power_candidate, s_power_armed, s_power_long;
 static int64_t s_power_changed_at, s_power_held_at;
+static int64_t s_power_released_at;     /* last debounced release the poll saw */
+static bool s_pmic_irq;                 /* the PM1's IRQ output is set up */
+static bool s_irq_stuck;                /* the line stayed low after clearing */
 static unsigned poll_power_button(void);
 
 /* Both chips are microcontrollers and now and then miss a transfer; retry. */
@@ -191,6 +222,69 @@ static int pmic_mv(uint8_t reg)
 {
     uint8_t b[2];
     return reg_read(s_pmic, reg, b, sizeof(b)) == ESP_OK ? b[0] | b[1] << 8 : 0;
+}
+
+/* Writing 0 clears every status bit and lets the IRQ line go high again. */
+static esp_err_t pmic_irq_clear(void)
+{
+    esp_err_t err = ESP_OK;
+    for (uint8_t reg = PMIC_IRQ_STATUS1; reg <= PMIC_IRQ_STATUS3; reg++) {
+        esp_err_t e = reg_write(s_pmic, reg, (uint8_t[]){ 0 }, 1);
+        err = err == ESP_OK ? e : err;
+    }
+    return err;
+}
+
+/*
+ * The PM1 pulls GPIO12 low for two power key events only, IRQ_STATUS3's
+ * SINGLE_CLICK (bit 0) and DOUBLE_CLICK (bit 2):
+ * - The manual raises SINGLE_CLICK only with single-click reset disabled
+ *   (init does) and DOUBLE_CLICK only with double-click power-off disabled
+ *   (it isn't, so a double click still powers off; unmasked anyway).
+ * - A click is reported once the key is released and the click delay
+ *   (BTN_CFG1 [2:1]) has passed. M5's firmware leaves it at 1 s; 125 ms here,
+ *   so a tap at rest wakes the screen about that long after it's let go.
+ *   Nothing is reported for a press or a hold: the paused wait's timeout
+ *   (1 s, 10 s napping) still polls the live key, and poll_power_button
+ *   turns a click no poll saw into a press and release.
+ * - WAKEUP (bit 1) stays masked: it's the power-on event, and the manual says
+ *   it stays set (holding the line low) until WAKE_SRC is cleared. GPIO level
+ *   changes (the charger's CHG_STAT on GPIO2) and 5VIN/battery events stay
+ *   masked too; USB power is noticed by the timeout as before.
+ * The pin is open drain; GPIO12's internal pull-up (muse_gpio_button_init)
+ * holds it high, also in light sleep (PM_SLP_DISABLE_GPIO is off).
+ */
+static esp_err_t pmic_irq_setup(void)
+{
+    ESP_RETURN_ON_ERROR(pmic_update(PMIC_IRQ_MASK1, PMIC_IRQ_GPIO_ALL, PMIC_IRQ_GPIO_ALL), TAG, "mask gpio irqs");
+    ESP_RETURN_ON_ERROR(pmic_update(PMIC_IRQ_MASK2, PMIC_IRQ_SYS_ALL, PMIC_IRQ_SYS_ALL), TAG, "mask system irqs");
+    ESP_RETURN_ON_ERROR(pmic_update(PMIC_IRQ_MASK3, PMIC_IRQ_BTN_ALL, PMIC_IRQ_BTN_WAKE), TAG, "unmask clicks");
+    ESP_RETURN_ON_ERROR(pmic_update(PMIC_BTN_CFG1, PMIC_CLICK_DELAY_MASK, PMIC_CLICK_DELAY_125MS), TAG, "click delay");
+    ESP_RETURN_ON_ERROR(pmic_update(PMIC_GPIO_OD, PMIC_IRQ_PIN, PMIC_IRQ_PIN), TAG, "irq open drain");
+    ESP_RETURN_ON_ERROR(pmic_update(PMIC_GPIO_FUNC0, PMIC_FUNC_GPIO1_MASK, PMIC_FUNC_GPIO1_IRQ), TAG, "gpio1 irq");
+    return pmic_irq_clear();
+}
+
+/*
+ * The line is low: read which key event it was, then clear every status.
+ * Returns true for a click. Still low afterwards (a failed transfer, or an
+ * event that won't clear), the paused wait stops trusting the line and polls
+ * every REST_FALLBACK_MS until it reads high again.
+ */
+static bool take_power_irq(void)
+{
+    if (!s_pmic_irq) {
+        return false;
+    }
+    if (gpio_get_level(PMIC_IRQ_GPIO)) {
+        s_irq_stuck = false;
+        return false;
+    }
+    uint8_t st = 0;
+    bool read = reg_read(s_pmic, PMIC_IRQ_STATUS3, &st, 1) == ESP_OK;
+    pmic_irq_clear();
+    s_irq_stuck = gpio_get_level(PMIC_IRQ_GPIO) == 0;
+    return read && (st & (PMIC_IRQ_BTN_CLICK | PMIC_IRQ_BTN_DOUBLE));
 }
 
 /* The expander's registers come in pairs, IO1-8 then IO9-14. The amp (audio
@@ -329,6 +423,13 @@ static esp_err_t init(void)
     s_speaker.pressed = gpio_get_level(SPEAKER_GPIO) == 0;
     s_power_pressed = s_power_candidate = true;
     s_power_changed_at = esp_timer_get_time();
+
+    /* Without the PM1's interrupt, wait_buttons() polls the red key every
+     * REST_FALLBACK_MS instead (the two GPIO keys still interrupt). */
+    s_pmic_irq = muse_gpio_button_init(&s_irq_line, PMIC_IRQ_GPIO) == ESP_OK && pmic_irq_setup() == ESP_OK;
+    if (!s_pmic_irq) {
+        ESP_LOGW(TAG, "power key interrupt not set up: polling the power key at rest");
+    }
     return ESP_OK;
 }
 
@@ -524,11 +625,14 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     return *spk && *mic ? ESP_OK : ESP_FAIL;
 }
 
-/* Read the live PMIC key, not its IRQ click flag (no held state there).
- * Failed transfers never create edges or count towards a shutdown hold. */
+/* Read the live PMIC key: its IRQ click flag has no held state. A click
+ * only stands in for a tap the poll missed (pmic_irq_setup). Failed
+ * transfers never create edges or count towards a shutdown hold. */
 static unsigned poll_power_button(void)
 {
+    static bool click_pending;
     int64_t now = esp_timer_get_time();
+    click_pending |= take_power_irq();
     uint8_t status;
     if (reg_read(s_pmic, PMIC_BTN_STATUS, &status, 1) != ESP_OK) {
         s_power_changed_at = now;
@@ -545,6 +649,9 @@ static unsigned poll_power_button(void)
     if (pressed != s_power_pressed && now - s_power_changed_at >= POWER_DEBOUNCE_US) {
         s_power_pressed = pressed;
         s_power_long = false;
+        if (!pressed) {
+            s_power_released_at = now;
+        }
         if (!pressed && !s_power_armed) {
             s_power_armed = true;   /* release after boot: not an input event */
         } else if (s_power_armed) {
@@ -558,6 +665,17 @@ static unsigned poll_power_button(void)
             ev |= MUSE_BTN_POWER_LONG;
         }
     }
+    /* A tap at rest: the PM1 reports it once the key is up again, so the
+     * poll it woke sees no press. Report the press and release together
+     * (a latched short, as the 1.75's PMU key gives), unless a release the
+     * poll saw just now was this click, or the key is down again. */
+    if (click_pending) {
+        click_pending = false;
+        if (!pressed && !s_power_pressed && !ev && s_power_armed &&
+            now - s_power_released_at >= CLICK_CREDIT_US) {
+            ev = MUSE_BTN_POWER_PRESS | MUSE_BTN_POWER_RELEASE;
+        }
+    }
     return ev;
 }
 
@@ -565,6 +683,36 @@ static unsigned poll_buttons(void)
 {
     return muse_gpio_button_poll(&s_talk) |
            muse_gpio_button_poll(&s_speaker) << 13 | poll_power_button();
+}
+
+/*
+ * Display paused: sleep until a rim key changes or the PM1 pulls GPIO12 low
+ * for a power key click (pmic_irq_setup), so the chip light-sleeps instead
+ * of waking every 50 ms for an I2C read. poll_buttons() takes and clears the
+ * PM1's event after each wake. The timeout still polls the live key, which
+ * is how a held key (no click yet) is found. While the red key is down or
+ * settling it's polled every REST_KEY_POLL_MS as before, so its debounce and
+ * 1.5 s hold work unchanged. Without a working interrupt line, waits are
+ * capped at REST_FALLBACK_MS.
+ */
+static void wait_buttons(int timeout_ms)
+{
+    if (s_power_pressed || s_power_candidate) {
+        vTaskDelay(pdMS_TO_TICKS(REST_KEY_POLL_MS));
+        return;
+    }
+    muse_gpio_button_t *const lines[] = { &s_talk, &s_speaker, &s_irq_line };
+    int n = 3;
+    if (!s_pmic_irq || s_irq_stuck) {
+        n = 2;
+    } else if (!gpio_get_level(PMIC_IRQ_GPIO)) {
+        vTaskDelay(pdMS_TO_TICKS(IRQ_SETTLE_MS));   /* fell since the poll: take it next */
+        return;
+    }
+    if (n == 2 && timeout_ms > REST_FALLBACK_MS) {
+        timeout_ms = REST_FALLBACK_MS;
+    }
+    muse_gpio_buttons_wait(lines, n, timeout_ms);
 }
 
 /* The power chip measures the battery and USB; the charger's CHG_STAT reaches its GPIO2. */
@@ -625,8 +773,8 @@ static const muse_board_t s_board = {
     .audio_init = audio_init,
     .mic_slot = 0,              /* one mic, on the left slot */
     .poll_buttons = poll_buttons,
-    /* Red POWER is on the PMIC, with no ESP interrupt: poll even while paused. */
-    .wait_buttons = NULL,
+    /* Red POWER is on the PMIC: its click interrupt (GPIO12) wakes the wait. */
+    .wait_buttons = wait_buttons,
     .read_power = read_power,
     .power_off = power_off,
 };
