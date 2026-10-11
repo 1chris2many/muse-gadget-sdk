@@ -356,14 +356,19 @@ static bool ws_send_frame_inplace(esp_tls_t *tls, uint8_t *payload, size_t len) 
     memcpy(hdr + hdr_len, &mask_key, 4);
     hdr_len += 4;
 
-    // Mask a word at a time where the payload is word-aligned (it is, in
-    // ws_buf); the mask repeats every 4 bytes, so whole words take it as is.
-    size_t i = 0;
-    if ((reinterpret_cast<uintptr_t>(payload) & 3) == 0) {
-        uint32_t *w = reinterpret_cast<uint32_t *>(payload);
-        for (; i + 4 <= len; i += 4) *w++ ^= mask_key;
-    }
+    // Mask a word at a time: bytes up to the first word boundary, then whole
+    // words with the mask rotated to that offset, then the tail. (Payloads
+    // in ws_buf are word-aligned; tunnel batches sealed in place may not be.)
     const uint8_t *mk = reinterpret_cast<const uint8_t *>(&mask_key);
+    size_t i = 0;
+    for (; i < len && (reinterpret_cast<uintptr_t>(payload + i) & 3); i++) {
+        payload[i] ^= mk[i & 3];
+    }
+    uint32_t word_mask;
+    uint8_t *wm = reinterpret_cast<uint8_t *>(&word_mask);
+    for (int k = 0; k < 4; k++) wm[k] = mk[(i + k) & 3];
+    uint32_t *w = reinterpret_cast<uint32_t *>(payload + i);
+    for (; i + 4 <= len; i += 4) *w++ ^= word_mask;
     for (; i < len; i++) payload[i] ^= mk[i & 3];
 
     uint8_t *frame = payload - hdr_len;
@@ -986,6 +991,27 @@ static bool tunnel_send_body(void *vctx, const uint8_t *data, size_t len) {
         return false;
     }
     return flush_outbound(c->tls, *c->session, c->ws_buf);
+}
+
+// The same, encoding and encrypting the batch where it sits in its tunnel
+// slot (noise_tunnel.cpp): no copy into the service, envelope and WebSocket
+// buffers. Falls back to the copying path if the session can't (another
+// outbound message mid-flight).
+static bool tunnel_send_body_inplace(void *vctx, uint8_t *buf, size_t headroom,
+                                     size_t len, size_t tailroom) {
+    auto *c = static_cast<tunnel_emit_ctx *>(vctx);
+    auto r = c->session->SealBodyChunkInPlace(
+        ServiceType::Daemon, TUNNEL_STREAM_ID,
+        ByteSpan(buf, headroom + len + tailroom), headroom, len);
+    if (r.status.IsFailedPrecondition() && c->session->isEstablished()) {
+        return tunnel_send_body(vctx, buf + headroom, len);
+    }
+    if (!r.status.ok() || r.offset < 14) {
+        ESP_LOGE(TAG, "tunnel SealBodyChunkInPlace failed: %s (offset %u)",
+                 r.status.str(), (unsigned)r.offset);
+        return false;
+    }
+    return ws_send_frame_inplace(c->tls, buf + r.offset, r.size);
 }
 
 // ---- Extra daemon requests (noise_ctrl_req_*) --------------------------------
@@ -2097,7 +2123,8 @@ static session_result_t run_session(stack_monitor_t *stack) {
     // this connection has a registered device. Opening before the ack races the
     // registration and takes a 403 + slow reopen.
     tunnel_emit_ctx tun_ctx = {tls, &session, svc_scratch, env_scratch, ws_buf};
-    noise_tunnel_emit_t tun_emit = {&tun_ctx, tunnel_open_stream, tunnel_send_body};
+    noise_tunnel_emit_t tun_emit = {&tun_ctx, tunnel_open_stream, tunnel_send_body,
+                                    tunnel_send_body_inplace};
     bool tunnel_opened = false;
     uint64_t last_busy_us = esp_timer_get_time();
 
