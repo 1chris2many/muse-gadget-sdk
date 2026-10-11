@@ -87,6 +87,10 @@ static const char *TAG = "board";
 #define I2S_WS GPIO_NUM_15
 #define I2S_DOUT GPIO_NUM_21
 #define I2S_DIN GPIO_NUM_16
+#define CODEC_POWER_UP_MS 10       /* AU_L3B up before the ES8311's setup, as M5Unified waits */
+#define CODEC_MIN_OFF_US 200000    /* AU_L3B off at least this long: a quickly cycled rail misfires */
+#define CODEC_ARM_MS 30            /* M5Unified arms capture at +30/60/90 ms of running I2S clock */
+#define ES8311_REG_SYSTEM 0x0D     /* 0x01: analog circuitry powered up */
 
 #define TALK_GPIO GPIO_NUM_1       /* KEYB / BtnB, blue, upper right: PTT */
 #define SPEAKER_GPIO GPIO_NUM_2    /* KEYA / BtnA, yellow, upper left: speaker */
@@ -173,6 +177,11 @@ static i2c_master_dev_handle_t s_pmic, s_ioe, s_tp;
 static SemaphoreHandle_t s_ioe_lock;
 static esp_lcd_panel_io_handle_t s_io;
 static esp_lcd_panel_handle_t s_panel;
+static const audio_codec_if_t *s_codec;
+static es8311_codec_cfg_t s_es_cfg;     /* the ES8311's setup, run again after a power-up */
+static bool s_codec_off;                /* AU_L3B off, the I2S lines parked (codec_power) */
+static bool s_codec_arm;                /* powered up since the capture path was last armed */
+static int64_t s_codec_off_at;
 /* The panel's state, kept on the send task (muse_lcd_bands_run): the CO5300
  * forgets its setup, brightness and sleep with 3V3_L3B (display_pause). */
 static bool s_lcd_off;                  /* rail off: nothing goes to the panel */
@@ -713,6 +722,108 @@ static void display_pause(bool pause)
     }
 }
 
+/*
+ * AU_L3B feeds the ES8311 and the LMA3729 mic and is switched by the
+ * expander's IO3 (schematic sheets 2, 3 and 5). The codec's I2C goes through
+ * 2N7002 hot-plug isolation, so the shared bus survives it off; M5Unified
+ * keeps it off until audio is used. Unpowered, the codec mustn't be fed
+ * through its I2S pins, so MCLK, BCLK, WS and DOUT go to plain GPIOs driven
+ * low and DIN to an input without pulls. Their routing to the duplex master
+ * channels is saved first and put back as the I2S driver set it.
+ */
+static const gpio_num_t s_i2s_pins[] = { I2S_MCLK, I2S_BCLK, I2S_WS, I2S_DOUT, I2S_DIN };
+static gpio_io_config_t s_i2s_saved[5];
+
+static void i2s_park(bool park)
+{
+    for (int i = 0; i < 5; i++) {
+        gpio_num_t pin = s_i2s_pins[i];
+        bool input = pin == I2S_DIN;
+        if (park) {
+            gpio_get_io_config(pin, &s_i2s_saved[i]);
+            if (!input) {
+                gpio_set_level(pin, 0);
+            }
+            gpio_set_direction(pin, input ? GPIO_MODE_INPUT : GPIO_MODE_OUTPUT);
+            gpio_set_pull_mode(pin, GPIO_FLOATING);
+            continue;
+        }
+        const gpio_io_config_t *io = &s_i2s_saved[i];
+        gpio_set_pull_mode(pin, io->pu && io->pd ? GPIO_PULLUP_PULLDOWN
+                                : io->pu         ? GPIO_PULLUP_ONLY
+                                : io->pd         ? GPIO_PULLDOWN_ONLY
+                                                 : GPIO_FLOATING);
+        if (!input) {
+            /* As i2s_gpio_check_and_set() routes an output (no inversion). */
+            gpio_set_direction(pin, io->ie ? GPIO_MODE_INPUT_OUTPUT : GPIO_MODE_OUTPUT);
+            esp_rom_gpio_connect_out_signal(pin, io->sig_out, false, false);
+        }
+    }
+}
+
+/*
+ * muse_audio calls this on before the codecs open and off once both have
+ * closed to rest; the amp (IOE10) is already off by then (es8311 pa_pin). A
+ * power-on reset loses es8311_open()'s setup, which esp_codec_dev_open()
+ * doesn't repeat, so it's run again here. M5Unified's notes on this codec:
+ * a quickly cycled rail misfires (so the rail stays off CODEC_MIN_OFF_US at
+ * least), capture has to be armed again with the I2S clock running
+ * (audio_power), and the analog stage takes ~1 s to settle after power-up.
+ */
+static void codec_power(bool on)
+{
+    if (on != s_codec_off) {
+        return;
+    }
+    if (!on) {
+        i2s_park(true);
+        if (ioe_set(IOE_AUDIO, false) != ESP_OK) {
+            ESP_LOGW(TAG, "audio rail off failed");
+        }
+        s_codec_off = true;
+        s_codec_off_at = esp_timer_get_time();
+        ESP_LOGI(TAG, "audio rail off");
+        return;
+    }
+    int64_t off_us = esp_timer_get_time() - s_codec_off_at;
+    if (off_us < CODEC_MIN_OFF_US) {
+        vTaskDelay(pdMS_TO_TICKS((CODEC_MIN_OFF_US - off_us) / 1000 + 1));
+    }
+    if (ioe_set(IOE_AUDIO, true) != ESP_OK) {
+        ESP_LOGW(TAG, "audio rail on failed");   /* the codecs won't open; retried on the next */
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(CODEC_POWER_UP_MS));
+    i2s_park(false);
+    s_codec_off = false;
+    s_codec_arm = true;
+    if (s_codec && s_codec->open(s_codec, &s_es_cfg, sizeof(s_es_cfg)) != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "ES8311 setup after power-up failed");
+    }
+    ESP_LOGI(TAG, "audio rail on");
+}
+
+/*
+ * Codecs open and the I2S clock running: after a power-up, arm the ES8311's
+ * capture path. M5Unified (_microphone_post_start_cb_stopwatch): a SYSTEM
+ * (0x0D) write arms it only with the clock running, the earliest seen at
+ * ~25 ms, so three writes at 30 ms steps. es8311_start()'s own write comes
+ * a few ms after the clock starts, which can be too soon. At boot the codec
+ * is set up with the clock already running, as before.
+ */
+static void audio_power(bool on)
+{
+    if (!on || !s_codec_arm || !s_codec) {
+        return;
+    }
+    bool ok = false;
+    for (int i = 0; i < 3; i++) {
+        vTaskDelay(pdMS_TO_TICKS(CODEC_ARM_MS));
+        ok = s_codec->set_reg(s_codec, ES8311_REG_SYSTEM, 0x01) == ESP_CODEC_DEV_OK;
+    }
+    s_codec_arm = !ok;   /* the last write acknowledged, or try again next open */
+}
+
 /* One ES8311 does both directions over a duplex I2S bus, clocked from MCLK. */
 static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
 {
@@ -742,7 +853,7 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
     ESP_RETURN_ON_FALSE(data_if && ctrl_if, ESP_ERR_NO_MEM, TAG, "codec interfaces");
 
-    es8311_codec_cfg_t es_cfg = {
+    s_es_cfg = (es8311_codec_cfg_t){
         .ctrl_if = ctrl_if,
         .gpio_if = &s_ioe_gpio,
         .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
@@ -750,8 +861,9 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
         .use_mclk = true,
         .hw_gain = { .pa_voltage = 5.0, .codec_dac_voltage = 3.3 },
     };
-    const audio_codec_if_t *codec = es8311_codec_new(&es_cfg);
+    const audio_codec_if_t *codec = es8311_codec_new(&s_es_cfg);
     ESP_RETURN_ON_FALSE(codec, ESP_FAIL, TAG, "ES8311 not responding");
+    s_codec = codec;
 
     esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = codec, .data_if = data_if };
     esp_codec_dev_cfg_t in_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_IN, .codec_if = codec, .data_if = data_if };
@@ -907,6 +1019,8 @@ static const muse_board_t s_board = {
     .display_pause = display_pause,
     .audio_init = audio_init,
     .mic_slot = 0,              /* one mic, on the left slot */
+    .audio_power = audio_power,
+    .codec_power = codec_power,
     .poll_buttons = poll_buttons,
     /* Red POWER is on the PMIC: its click interrupt (GPIO12) wakes the wait. */
     .wait_buttons = wait_buttons,

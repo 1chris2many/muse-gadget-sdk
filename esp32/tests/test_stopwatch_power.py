@@ -274,6 +274,189 @@ int main(int argc, char **argv) {
 '''
         self.run_cases(self.build("oled", code), 3)
 
+    def test_codec_supply_in_muse_audio(self):
+        """muse_audio powers a board-switched codec around open and close, and never touches it off."""
+        audio = (MUSE / "muse_audio.c").read_text()
+        code = COMMON + r'''
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_CODEC_DEV_OK 0
+#define portMAX_DELAY 0xffffffffu
+#define ESP_RETURN_ON_FALSE(c, err, tag, ...) do { if (!(c)) return err; } while (0)
+typedef enum { ESP_LOG_NONE } esp_log_level_t;
+static esp_log_level_t esp_log_level_get(const char *t) { (void)t; return ESP_LOG_NONE; }
+static void esp_log_level_set(const char *t, esp_log_level_t l) { (void)t; (void)l; }
+#define ESP_LOGE(...) ((void)0)
+typedef struct { int sample_rate, channel, bits_per_sample; } esp_codec_dev_sample_info_t;
+typedef int *esp_codec_dev_handle_t;
+static int spk_dev, mic_dev;
+static char ev[2048];
+static int locked, lock_ops, mic_fail;
+static void note(const char *e) { strcat(ev, e); strcat(ev, " "); }
+static const char *who(esp_codec_dev_handle_t h) { return h == &spk_dev ? "spk" : "mic"; }
+typedef void *SemaphoreHandle_t;
+static SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (void *)1; }
+static int xSemaphoreTake(SemaphoreHandle_t s, unsigned t) { (void)s; (void)t; assert(!locked); locked = 1; ++lock_ops; return 1; }
+static int xSemaphoreGive(SemaphoreHandle_t s) { (void)s; assert(locked); locked = 0; return 1; }
+static int esp_codec_dev_open(esp_codec_dev_handle_t h, esp_codec_dev_sample_info_t *fs) {
+    (void)fs; char b[16]; snprintf(b, sizeof(b), "open-%s", who(h)); note(b);
+    return h == &mic_dev && mic_fail ? -1 : ESP_CODEC_DEV_OK;
+}
+static int esp_codec_dev_close(esp_codec_dev_handle_t h) { char b[16]; snprintf(b, sizeof(b), "close-%s", who(h)); note(b); return 0; }
+static int esp_codec_dev_set_out_vol(esp_codec_dev_handle_t h, int v) { assert(h == &spk_dev); char b[16]; snprintf(b, sizeof(b), "vol%d", v); note(b); return 0; }
+static int esp_codec_dev_set_in_gain(esp_codec_dev_handle_t h, float db) { assert(h == &mic_dev); char b[16]; snprintf(b, sizeof(b), "gain%d", (int)db); note(b); return 0; }
+static int muse_settings_volume(void) { return 70; }
+static int muse_settings_mic_gain(void) { return 24; }
+static void board_codec_power(bool on) { assert(locked || !lock_ops); note(on ? "rail-on" : "rail-off"); }
+static void board_audio_power(bool on) { note(on ? "amp-on" : "amp-off"); }
+static int board_audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic) { note("audio-init"); *spk = &spk_dev; *mic = &mic_dev; return ESP_OK; }
+static struct {
+    int (*audio_init)(esp_codec_dev_handle_t *, esp_codec_dev_handle_t *);
+    void (*set_mic_gain)(esp_codec_dev_handle_t, int);
+    void (*audio_power)(bool);
+    void (*codec_power)(bool);
+} board = { board_audio_init, NULL, board_audio_power, board_codec_power }, *muse_board = &board;
+#define CHANNELS 2
+#define MUSE_AUDIO_RATE 16000
+static esp_codec_dev_handle_t s_spk;
+static esp_codec_dev_handle_t s_mic;
+static bool s_open;
+static SemaphoreHandle_t s_lock;
+''' + "\n".join(function(audio, n) for n in (
+            "lock", "unlock", "codec_power", "codecs_reachable", "apply_volume", "apply_mic_gain", "open_codecs",
+            "muse_audio_power", "muse_audio_set_volume", "muse_audio_set_mic_gain")) + r'''
+static void expect(const char *want) {
+    if (strcmp(ev, want)) { printf("got:  %s\nwant: %s\n", ev, want); exit(1); }
+    ev[0] = 0;
+}
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    int test = atoi(argv[1]);
+    s_spk = &spk_dev; s_mic = &mic_dev; s_open = true; s_lock = xSemaphoreCreateMutex();
+    if (test == 0) {   /* rest and wake: supply around close and open, settings reapplied */
+        muse_audio_power(false);
+        expect("amp-off close-spk close-mic rail-off ");
+        muse_audio_set_volume(40); muse_audio_set_mic_gain(30);
+        expect("");                                  /* unpowered: nothing reaches the codec */
+        muse_audio_power(false); expect("");
+        muse_audio_power(true);
+        expect("rail-on open-spk open-mic vol70 gain24 amp-on ");
+        muse_audio_set_volume(40); muse_audio_set_mic_gain(30);
+        expect("vol40 gain30 ");
+        assert(!locked);
+    } else if (test == 1) {   /* a failed open leaves it closed: setters still skip, the next wake retries */
+        muse_audio_power(false); ev[0] = 0; mic_fail = 1;
+        muse_audio_power(true);
+        expect("rail-on open-spk open-mic close-spk ");
+        muse_audio_set_volume(40); expect("");
+        mic_fail = 0; muse_audio_power(true);
+        expect("rail-on open-spk open-mic vol70 gain24 amp-on ");
+    } else {   /* other boards (no codec_power): unchanged, setters reach a closed codec as before */
+        board.codec_power = NULL;
+        muse_audio_power(false); expect("amp-off close-spk close-mic ");
+        muse_audio_set_volume(40); muse_audio_set_mic_gain(30); expect("vol40 gain30 ");
+        muse_audio_power(true); expect("open-spk open-mic vol70 gain24 amp-on ");
+    }
+    return 0;
+}
+'''
+        self.run_cases(self.build("audio", code), 3)
+        init = function(audio, "muse_audio_init")
+        self.assertLess(init.index("codec_power(true)"), init.index("muse_board->audio_init("))
+
+    def test_stopwatch_codec_supply(self):
+        """The StopWatch parks I2S, cuts AU_L3B, and sets the ES8311 up and re-arms it after power-up."""
+        code = COMMON + defines(self.board, r"I2S_\w+|CODEC_\w+|ES8311_REG_SYSTEM|IOE_\w+") + r'''
+#define GPIO_NUM_15 15
+#define GPIO_NUM_16 16
+#define GPIO_NUM_17 17
+#define GPIO_NUM_18 18
+#define GPIO_NUM_21 21
+#define ESP_CODEC_DEV_OK 0
+typedef int gpio_num_t;
+typedef enum { GPIO_MODE_INPUT = 1, GPIO_MODE_OUTPUT = 2, GPIO_MODE_INPUT_OUTPUT = 3 } gpio_mode_t;
+typedef enum { GPIO_PULLUP_ONLY, GPIO_PULLDOWN_ONLY, GPIO_PULLUP_PULLDOWN, GPIO_FLOATING } gpio_pull_mode_t;
+typedef struct { uint32_t sig_out; bool pu, pd, ie, oe; } gpio_io_config_t;
+typedef struct { int cfg; } es8311_codec_cfg_t;
+typedef struct audio_codec_if_t audio_codec_if_t;
+struct audio_codec_if_t {
+    int (*open)(const audio_codec_if_t *h, void *cfg, int size);
+    int (*set_reg)(const audio_codec_if_t *h, int reg, int value);
+};
+static char ev[4096];
+static void note(const char *fmt, int v) { char b[40]; snprintf(b, sizeof(b), fmt, v); strcat(ev, b); strcat(ev, " "); }
+static int64_t now = 5000000;
+static int64_t esp_timer_get_time(void) { return now; }
+static void vTaskDelay(int ms) { note("wait%d", ms); now += ms * 1000; }
+static bool rail = true;
+static int ioe_set(uint16_t pins, bool high) { assert(pins == IOE_AUDIO); rail = high; note("rail=%d", high); return ESP_OK; }
+static struct { int level, mode, pull; uint32_t sig; } pin[48];
+static int gpio_get_io_config(gpio_num_t p, gpio_io_config_t *io) {
+    *io = (gpio_io_config_t){ .sig_out = pin[p].sig, .ie = pin[p].mode & 1, .oe = pin[p].mode & 2 }; return ESP_OK;
+}
+static int gpio_set_level(gpio_num_t p, int l) { pin[p].level = l; return ESP_OK; }
+static int gpio_set_direction(gpio_num_t p, gpio_mode_t m) { pin[p].mode = m; if (m & GPIO_MODE_OUTPUT) pin[p].sig = 256; return ESP_OK; }
+static int gpio_set_pull_mode(gpio_num_t p, gpio_pull_mode_t m) { pin[p].pull = m; return ESP_OK; }
+static void esp_rom_gpio_connect_out_signal(gpio_num_t p, uint32_t sig, bool inv, bool oen_inv) {
+    assert(!inv && !oen_inv && sig != 256); pin[p].sig = sig;
+}
+static es8311_codec_cfg_t s_es_cfg = { 42 };
+static int opens, arms, arm_fail;
+static int fake_open(const audio_codec_if_t *h, void *cfg, int size) {
+    (void)h; assert(rail && cfg == &s_es_cfg && size == sizeof(s_es_cfg)); ++opens; note("es8311-setup", 0); return 0;
+}
+static int fake_set_reg(const audio_codec_if_t *h, int reg, int value) {
+    (void)h; assert(rail && reg == 0x0D && value == 0x01); ++arms; note("arm", 0); return arm_fail ? -1 : 0;
+}
+static const audio_codec_if_t codec = { fake_open, fake_set_reg };
+static const audio_codec_if_t *s_codec;
+static bool s_codec_off, s_codec_arm;
+static int64_t s_codec_off_at;
+''' + re.search(r"^static const gpio_num_t s_i2s_pins.*?\n.*?\n", self.board, re.M | re.S).group(0) + "\n".join(function(self.board, n) for n in (
+            "i2s_park", "codec_power", "audio_power")) + r'''
+static void expect(const char *want) {
+    if (strcmp(ev, want)) { printf("got:  %s\nwant: %s\n", ev, want); exit(1); }
+    ev[0] = 0;
+}
+static const int sigs[] = { 23, 24, 25, 26 };   /* MCLK, BCLK, WS, DOUT as the I2S driver routed them */
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    int test = atoi(argv[1]);
+    const gpio_num_t outs[] = { I2S_MCLK, I2S_BCLK, I2S_WS, I2S_DOUT };
+    for (int i = 0; i < 4; i++) { pin[outs[i]].mode = GPIO_MODE_OUTPUT; pin[outs[i]].sig = sigs[i]; pin[outs[i]].level = 1; }
+    pin[I2S_DIN].mode = GPIO_MODE_INPUT; pin[I2S_DIN].pull = GPIO_FLOATING;
+    s_codec = &codec;
+    if (test == 0) {   /* boot: already on, nothing to do; first audio_power arms nothing */
+        codec_power(true); audio_power(true); expect("");
+        assert(opens == 0 && arms == 0);
+    } else if (test == 1) {   /* rest, then wake soon after: min off time, setup, routing back, armed once */
+        codec_power(false);
+        expect("rail=0 ");
+        for (int i = 0; i < 4; i++) assert(pin[outs[i]].level == 0 && pin[outs[i]].mode == GPIO_MODE_OUTPUT && pin[outs[i]].sig == 256 && pin[outs[i]].pull == GPIO_FLOATING);
+        assert(pin[I2S_DIN].mode == GPIO_MODE_INPUT && pin[I2S_DIN].pull == GPIO_FLOATING);
+        codec_power(false); expect("");
+        now += 50000;
+        codec_power(true);
+        expect("wait151 rail=1 wait10 es8311-setup ");
+        for (int i = 0; i < 4; i++) assert(pin[outs[i]].sig == (uint32_t)sigs[i] && pin[outs[i]].mode == GPIO_MODE_OUTPUT);
+        codec_power(true); expect("");
+        audio_power(false); expect("");
+        audio_power(true); expect("wait30 arm wait30 arm wait30 arm ");
+        audio_power(true); expect("");
+    } else {   /* a long rest: no extra wait; a failed arming is tried again next open */
+        codec_power(false); now += 60000000; ev[0] = 0;
+        codec_power(true); expect("rail=1 wait10 es8311-setup ");
+        arm_fail = 1; audio_power(true); assert(arms == 3 && s_codec_arm);
+        arm_fail = 0; ev[0] = 0; audio_power(true); expect("wait30 arm wait30 arm wait30 arm ");
+        assert(!s_codec_arm);
+    }
+    return 0;
+}
+'''
+        self.run_cases(self.build("codec", code), 3)
+        self.assertIn(".codec_power = codec_power", self.board)
+        self.assertIn(".audio_power = audio_power", self.board)
+        self.assertIn("s_codec = codec;", self.board)
+
     def test_rest_wiring(self):
         init = function(self.board, "init")
         self.assertIn("muse_gpio_button_init(&s_irq_line, PMIC_IRQ_GPIO)", init)
