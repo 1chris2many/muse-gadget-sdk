@@ -54,8 +54,8 @@ COMMON = r'''
 #define TAG "test"
 typedef int esp_err_t;
 #define ESP_RETURN_ON_ERROR(expr, tag, ...) do { int e_ = (expr); if (e_) return e_; } while (0)
-#define ESP_LOGI(...) ((void)0)
-#define ESP_LOGW(...) ((void)0)
+#define ESP_LOGI(tag, ...) ((void)(tag), (void)snprintf(NULL, 0, __VA_ARGS__))
+#define ESP_LOGW(tag, ...) ((void)(tag), (void)snprintf(NULL, 0, __VA_ARGS__))
 '''
 
 
@@ -456,6 +456,32 @@ int main(int argc, char **argv) {
         self.assertIn(".codec_power = codec_power", self.board)
         self.assertIn(".audio_power = audio_power", self.board)
         self.assertIn("s_codec = codec;", self.board)
+
+    def test_imu_soft_reset(self):
+        """A BMI270 that answers is soft-reset once; anything else is left alone."""
+        code = COMMON + defines(self.board, r"IMU_\w+") + r'''
+typedef void *i2c_master_bus_handle_t;
+typedef int *i2c_master_dev_handle_t;
+static i2c_master_bus_handle_t s_i2c = (void *)1;
+static int present = 1, chip_id = 0x24, resets, added, removed;
+static int dev;
+static int i2c_master_probe(i2c_master_bus_handle_t bus, int addr, int ms) { (void)ms; assert(bus == s_i2c && addr == 0x68); return present ? ESP_OK : -1; }
+static int add_device(uint8_t addr, uint32_t hz, i2c_master_dev_handle_t *d) { assert(addr == 0x68 && hz); *d = &dev; ++added; return ESP_OK; }
+static int i2c_master_bus_rm_device(i2c_master_dev_handle_t d) { assert(d == &dev); ++removed; return ESP_OK; }
+static int reg_read(i2c_master_dev_handle_t d, uint8_t reg, uint8_t *out, size_t n) { assert(d == &dev && reg == 0x00 && n == 1); *out = chip_id; return ESP_OK; }
+static int reg_write(i2c_master_dev_handle_t d, uint8_t reg, const uint8_t *v, size_t n) { assert(d == &dev && reg == 0x7E && n == 1 && v[0] == 0xB6); ++resets; return ESP_OK; }
+''' + function(self.board, "imu_rest") + r'''
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    int test = atoi(argv[1]);
+    if (test == 0) { imu_rest(); assert(resets == 1 && added == 1 && removed == 1); }
+    else if (test == 1) { chip_id = 0x26; imu_rest(); assert(resets == 0 && removed == 1); }   /* another chip at 0x68 */
+    else { present = 0; imu_rest(); assert(resets == 0 && added == 0 && removed == 0); }
+    return 0;
+}
+'''
+        self.run_cases(self.build("imu", code), 3)
+        self.assertIn("imu_rest();", function(self.board, "init"))
 
     def test_rest_wiring(self):
         init = function(self.board, "init")

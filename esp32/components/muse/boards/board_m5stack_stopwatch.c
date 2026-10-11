@@ -155,6 +155,12 @@ static const char *TAG = "board";
 #define REST_FALLBACK_MS 200       /* no PM1 interrupt: the longest a paused wait may last */
 #define IRQ_SETTLE_MS 10           /* the line just fell: the next poll takes the event */
 
+#define IMU_ADDR 0x68              /* BMI270 on 3V3_L1, sheet 5 (the BMM150 isn't fitted) */
+#define IMU_REG_CHIP_ID 0x00
+#define IMU_CHIP_ID 0x24
+#define IMU_REG_CMD 0x7E
+#define IMU_SOFT_RESET 0xB6
+
 #define IOE_ADDR 0x4F
 #define IOE_MODE 0x03              /* 16 bits, IO1 in bit 0; 1 = output */
 #define IOE_OUT 0x05
@@ -385,6 +391,26 @@ static void tp_reset(void)
     }
 }
 
+/*
+ * The BMI270 is on the always-on 3V3_L1 rail and M5's factory firmware turns
+ * its accelerometer on. Muse doesn't use it, so after a reflash it could
+ * keep running; a soft reset puts it back in its power-on state (sensors
+ * suspended, advanced power save on). Absent, nothing happens.
+ */
+static void imu_rest(void)
+{
+    i2c_master_dev_handle_t imu;
+    if (i2c_master_probe(s_i2c, IMU_ADDR, 50) != ESP_OK || add_device(IMU_ADDR, 400000, &imu) != ESP_OK) {
+        return;
+    }
+    uint8_t id = 0;
+    if (reg_read(imu, IMU_REG_CHIP_ID, &id, 1) == ESP_OK && id == IMU_CHIP_ID) {
+        esp_err_t err = reg_write(imu, IMU_REG_CMD, (uint8_t[]){ IMU_SOFT_RESET }, 1);
+        ESP_LOGI(TAG, "BMI270: %s", err == ESP_OK ? "soft reset, sensors suspended" : "soft reset failed");
+    }
+    i2c_master_bus_rm_device(imu);
+}
+
 static esp_err_t init(void)
 {
     s_ioe_lock = xSemaphoreCreateMutex();
@@ -435,6 +461,7 @@ static esp_err_t init(void)
     vTaskDelay(pdMS_TO_TICKS(10));
     ESP_RETURN_ON_ERROR(ioe_set(IOE_TP_RST | IOE_LCD_RST, true), TAG, "panel reset");
     vTaskDelay(pdMS_TO_TICKS(120));   /* the panel's wake from reset */
+    imu_rest();
 
     ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_talk, TALK_GPIO), TAG, "talk button");
     ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_speaker, SPEAKER_GPIO), TAG, "speaker button");
