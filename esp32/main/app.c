@@ -47,6 +47,7 @@
 #include "wifi_mgr.h"
 #include "wifi_known.h"
 #include "customer_product_info.h"
+#include "ble_coex.h"
 #include "ble_server.h"
 #include "factory_test.h"
 #include "vm_api.h"
@@ -663,6 +664,7 @@ static void shutdown_ble_task(void *arg) {
     ble_server_stop_advertising(false);
 #if CONFIG_HOMEHUB_BLE_PERSISTENT
     ble_server_set_companion_advertising(true);
+    ble_coex_set_active(true);
     ui_set_ble("companion");
 #endif
 #else
@@ -693,6 +695,7 @@ static bool complete_setup_and_stop_ble(const char *reason, uint32_t session_gen
         ble_server_stop_advertising(false);
 #if CONFIG_HOMEHUB_BLE_PERSISTENT
         ble_server_set_companion_advertising(true);
+        ble_coex_set_active(true);
 #endif
 #else
         ble_server_full_shutdown();
@@ -1968,6 +1971,7 @@ static void enter_advertising_state(const char *reason) {
     ui_set_ble("advertising");
     ui_set_status("pairing_advertising");
     led_status_set_state(LED_STATE_BLE_ADVERTISING);
+    ble_coex_set_active(false);  // setup keeps ESP-IDF's balanced sharing
     ble_server_begin_advertising();
 }
 
@@ -2093,6 +2097,7 @@ static void on_client_disconnected(void) {
     ui_set_status("pairing_advertising");
     led_status_set_state(LED_STATE_BLE_ADVERTISING);
     setup_window_lock_give();
+    ble_coex_set_active(false);
     ble_server_begin_advertising();
 }
 
@@ -2676,6 +2681,7 @@ void app_run(void) {
         // fragments internal RAM, and advertise the basic service slowly.
         start_ble_setup_server_if_needed();
         ble_server_set_companion_advertising(true);
+        ble_coex_set_active(true);
         ui_set_ble("companion");
 #endif
 #if CONFIG_MUSE_ENABLED && CONFIG_SPIRAM

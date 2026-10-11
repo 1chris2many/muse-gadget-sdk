@@ -420,9 +420,10 @@ The device still needs to be paired once for its token.
 
 - `sdkconfig.defaults.esp32c5` is loaded after `sdkconfig.defaults` for C5
   builds only (ESP-IDF's target-specific defaults): it moves lwIP and Wi-Fi
-  heap buffers to PSRAM and doubles the TCP windows to 32 KiB. Other chips
-  keep 16 KiB windows in internal RAM; `cmake/validate_config.cmake` enforces
-  both.
+  heap buffers to PSRAM, raises the TCP windows to 64 KiB and deepens the
+  Wi-Fi receive path to match (64 dynamic RX buffers, a 20-frame block-ack
+  window, no cap on out-of-order segments). Other chips keep 16 KiB windows
+  in internal RAM; `cmake/validate_config.cmake` enforces both.
 - Each build's generated `sdkconfig` lives in its build directory
   (`build/sdkconfig`, `build-<board>/sdkconfig`). Once it exists, it overrides
   later edits to `sdkconfig.defaults` or the overlays. After changing those,
@@ -438,8 +439,12 @@ The device still needs to be paired once for its token.
   boards with the full UI. `CONFIG_HOMEHUB_BLE_PERSISTENT` keeps NimBLE up
   beside Wi-Fi with a basic GATT service (`main/ble_basic.c`) advertised
   slowly; it costs roughly 40 KB of internal RAM for as long as the device
-  runs. `tools/coexist/` holds the overlays used to size it on the C5, and
-  the data-path bench (`CONFIG_HOMEHUB_PIPELINE_BENCH`) with its results.
+  runs (`tools/coexist/sdkconfig.ble-mem` wins most of it back on the C5).
+  On the C5, `CONFIG_HOMEHUB_BLE_COEX` (`main/ble_coex.c`) keeps BLE
+  advertising and connections from reserving half the radio's airtime once
+  setup is complete, which doubles Wi-Fi throughput with BLE up.
+  `tools/coexist/` holds the overlays used to size it, and the data-path
+  bench (`CONFIG_HOMEHUB_PIPELINE_BENCH`) with its results.
 - On the C5 with PSRAM, `CONFIG_HOMEHUB_FAST_GCM` (default on there) wraps
   ESP-IDF's one-shot AES-GCM with `main/fast_gcm.c` for TLS and Noise. Turn
   it off to compare against IDF's; `tests/test_ghash32.py` checks the tables.

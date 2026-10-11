@@ -24,7 +24,10 @@ own directory.
 ## Defaults this work changed
 
 - `sdkconfig.defaults.esp32c5` (C5 only): lwIP and Wi-Fi heap buffers prefer
-  PSRAM (`SPIRAM_TRY_ALLOCATE_WIFI_LWIP`) and the TCP windows double to 32 KiB.
+  PSRAM (`SPIRAM_TRY_ALLOCATE_WIFI_LWIP`), the TCP windows grow to 64 KiB,
+  and the Wi-Fi receive path deepens to take a whole window in one burst.
+- `CONFIG_HOMEHUB_BLE_COEX` (on for C5 with `CONFIG_HOMEHUB_BLE_PERSISTENT`):
+  Wi-Fi first radio sharing once setup is complete (`main/ble_coex.c`).
 - `CONFIG_HOMEHUB_FAST_GCM` (on for C5 with PSRAM): faster AES-GCM for TLS and
   Noise (`main/fast_gcm.c`, `main/ghash32.c`).
 - One TLS record per WebSocket frame and zero-copy tunnel batches, for every
@@ -36,15 +39,16 @@ own directory.
 |---|---|
 | `sdkconfig.ble-persist` | `CONFIG_HOMEHUB_BLE_PERSISTENT`: NimBLE stays up after setup, basic GATT service (`main/ble_basic.c`), slow advertising |
 | `sdkconfig.nimble-tuned` | NimBLE for a gadget that is a GATT server **and** a central (scan, connect, GATT client, `main/ble_central.c`): all roles and SMP kept, 3 connections, trimmed prepare-write queue, lists and logging |
-| `sdkconfig.ble-mem` | BLE resident without the RAM cost (after `ble-persist` and `nimble-tuned`): NimBLE host allocations in PSRAM, controller code in flash, BLE and Wi-Fi RX buffers trimmed |
+| `sdkconfig.ble-mem` | BLE resident without the RAM cost (after `ble-persist` and `nimble-tuned`): NimBLE host allocations in PSRAM, controller code in flash, BLE buffers and static Wi-Fi RX buffers trimmed |
 | `sdkconfig.wifi-trim` | No SoftAP or WPA2-Enterprise (-58 KB flash) |
 | `sdkconfig.net-internal16` | Bench baseline: the pre-change networking (lwIP in internal RAM, 16 KiB windows) |
 | `sdkconfig.tx-by-ref` | Require PSRAM at boot so Wi-Fi transmits lwIP's PSRAM pbufs by reference and window scaling is available |
-| `sdkconfig.tcp64`, `sdkconfig.tcp128` | 64 or 128 KiB TCP windows (128 needs `tx-by-ref`) |
+| `sdkconfig.tcp128` | 128 KiB receive / 112 KiB send windows (needs `tx-by-ref`; stalled the VM tunnel, not for use) |
 | `sdkconfig.ctrl-flash` | BLE controller from flash (-21 KB IRAM; experimental, slows BLE) |
 | `sdkconfig.bench`, `sdkconfig.bench-quick` | Boot into `main/pipeline_bench.cpp` instead of the gadget |
 
-A coexistence build (the networking now comes from the C5 defaults):
+A coexistence build (the networking and the radio sharing come from the C5
+defaults):
 
 ```sh
 idf.py -B build-coexist -DIDF_TARGET=esp32c5 -DSDKCONFIG=build-coexist/sdkconfig \
@@ -102,9 +106,11 @@ Tunnel TX and TLS RX, 5 GHz (channel 40), same run per row:
 Runs at RSSI near -68 dBm (the AP's mesh sometimes hands the board to a far
 node) are 2-10x slower whatever the build; compare within a row.
 
-Free internal DMA-capable RAM is the limit: with 64 KB windows its minimum
-fell to ~1 KB during bulk TX (Wi-Fi copies TX frames into internal buffers),
-so 64 KB windows need fewer Wi-Fi TX buffers or by-reference TX before use.
+On this LAN bench, free internal DMA-capable RAM was the limit for 64 KB
+windows: raw TCP at 13 Mbit/s drove its minimum to ~1 KB (Wi-Fi copies TX
+frames into internal buffers). Through the VM tunnel, which the CPU holds near
+4 Mbit/s, free DMA-capable RAM sampled every 5 s stayed at or above 22 KiB with
+64 KiB windows, and the tunnel holds back its own sends below a 16 KiB reserve.
 
 BLE beside Wi-Fi: scanning at 50% duty saw ~33 devices (21-27 reports/s,
 55-65 idle); the central connected to a peer in 170-630 ms, MTU 256, 9
@@ -144,7 +150,36 @@ throughput follows the window up to the C5's CPU.
 
 lwIP caps the send buffer near 117 KiB (its send low-water mark is 16-bit).
 
-Through a paired VM's Home Link tunnel, every build (16 or 32 KiB windows,
-BLE on or off) ran at 2.1-2.5 Mbit/s LAN to VM and 1.6-1.9 VM to LAN, and
-parallel flows shared that total: the limit is on the server path, past the
-gadget, not its windows.
+### Through a paired VM (Home Link tunnel, 2026-10-11)
+
+An 8 MB download to the VM and a 4 MB upload from it, through the tunnel, BLE
+resident (`ble-persist`, `nimble-tuned`, `ble-mem`), 5 GHz unless noted.
+Mbit/s as the LAN host measured them:
+
+| Build | To VM | From VM | Ping to the C5 (avg/max ms) |
+|---|---|---|---|
+| ESP-IDF's balanced radio sharing, BLE advertising | 2.0-2.6 | 1.9-2.4 | 20-36 / 60-180 |
+| ... with `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` | 2.3-2.6 | 1.9-2.3 | 25-29 / 96-129 |
+| `CONFIG_HOMEHUB_BLE_COEX`, BLE advertising | 3.6-4.2 | 3.4-3.9 | 4-5 / 11-32 |
+| ... with a central connected and reading every second | 3.5-3.8 | 3.6 | 5 / 18 |
+| ... while the C5 scans continuously | 2.8-3.1 | 1.9-2.8 | 5-8 / 30-55 |
+| BLE shut down (for comparison) | 3.9-4.2 | 3.4-3.8 | 4-9 / 15-70 |
+| `BLE_COEX` + 64 KiB windows + deep RX path (new C5 defaults) | 4.1 | 4.5-4.6 | 5 / 14-37 |
+
+- 2.4 GHz (channel 6) and 5 GHz (channel 40) behave the same: the C5 has one
+  RF path for both bands.
+- The radio sharing was the limit. While BLE advertises, scans or is
+  connected, ESP-IDF's scheduler splits every 102.4 ms beacon period in two
+  and gives BLE one half; Wi-Fi traffic waits out that half, so ACKs arrive in
+  bursts every ~100 ms and throughput halves.
+- With `BLE_COEX` the central's reads (160+ per run, once a second) all
+  succeeded, median 48-75 ms and at most 139 ms, and the C5's own scans kept
+  finding the same devices.
+- At 4 Mbit/s the C5's CPU is the limit (93-99% busy: the Noise session task
+  about 70%, Wi-Fi about 20%).
+- Over a 150 ms round trip, 64 KiB windows and the deep RX path raised the
+  download from 1.4 to 2.75 and the upload from 0.9 to 1.7. 64 KiB windows
+  without the deep RX path lost segments about ten times per upload and fell
+  to 1.8 Mbit/s even nearby.
+- Free internal RAM at idle, paired, is the same with the new defaults:
+  53 KiB (38 KiB DMA-capable).
