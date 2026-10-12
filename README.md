@@ -54,6 +54,17 @@ Meet other hackers who are building and customizing Muse gadgets in our
 community [Discord](https://discord.gg/3bhjCkZdd6). Get inspired, support each
 other, and share what you make.
 
+### Community Android port
+
+[Muse Portal Kit](https://github.com/1chris2many/muse-portal-kit) is an
+independent Kotlin/Android port for repurposing a first-generation Meta Portal
+(Android 9) as a foreground, push-to-talk Muse gadget. It includes protocol
+tests, direct Wi-Fi chat, voice-note transcripts, still-camera capture and an
+optional USB-assisted setup/development bridge. The README documents tested
+hardware, privacy behavior and current reply-correlation/command-routing limits.
+It is an experimental community project, not an official Android SDK or a
+supported Portal firmware image.
+
 ## License
 
 Muse Gadgets is licensed under the Apache License, Version 2.0, found in
